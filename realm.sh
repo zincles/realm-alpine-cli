@@ -420,6 +420,222 @@ restart_service() {
     service_is_active realm && echo -e "${GREEN}重启成功${PLAIN}" || echo -e "${RED}重启失败${PLAIN}"
 }
 
+# --- 命令行参数 ---
+
+cli_usage() {
+    cat <<EOF
+用法:
+  realm.sh                                     进入交互菜单
+  realm.sh --set-forward <规则> [选项]          非交互式设置转发
+
+规则格式: <本机端口>:<远程IP或域名>:<远程端口>
+  443:1.2.3.4:8443          转发本机 443 到 1.2.3.4 的 8443
+  80:example.com:8080       远程地址支持域名
+  443:[2001:db8::1]:8443    IPv6 远程地址需加方括号
+
+选项:
+  --set-forward <规则>   设置转发规则，可重复指定多条
+  --listen-addr <地址>   本机监听地址，默认 [::]（双栈，兼顾 IPv4）
+  --no-restart           仅写配置，不启用/重启服务
+  -h, --help             显示本帮助
+
+行为:
+  - 端口不存在时新增规则
+  - 端口已存在且远程地址相同则跳过（可重复执行，幂等）
+  - 端口已存在但远程地址不同则替换该条规则
+  - 默认自动 rc-update add realm default 并重启 realm 服务
+
+示例:
+  realm.sh --set-forward 443:1.2.3.4:8443
+  realm.sh --set-forward 80:example.com:8080 --set-forward 443:1.2.3.4:8443
+  realm.sh --set-forward 443:1.2.3.4:8443 --no-restart
+EOF
+}
+
+# 取指定本机端口已配置的 remote（无匹配则无输出）
+cli_get_remote() {
+    local port=$1
+    [ -f "$CONFIG_FILE" ] || return 0
+    awk -v p="$port" '
+        function reset() { inblk = 0; hit = 0 }
+        /^\[\[endpoints\]\]/ { reset(); inblk = 1; next }
+        /^\[/ { reset(); next }
+        inblk && /^listen =/ { hit = ($0 ~ ("^listen = \"[^\"]*:" p "\"$")) ? 1 : 0 }
+        inblk && hit && /^remote =/ {
+            line = $0
+            sub(/^remote = "/, "", line)
+            sub(/"$/, "", line)
+            print line
+            exit
+        }
+    ' "$CONFIG_FILE"
+}
+
+# 删除指定本机端口所在的整个 [[endpoints]] 段，其余内容原样保留
+# 仅用 awk 实现（busybox cat 不支持 -s 等 GNU 专有选项）
+cli_remove_endpoint() {
+    local port=$1 tmp
+    tmp=$(mktemp) || return 1
+    awk -v p="$port" '
+        # 延迟输出空行：仅在其后有内容时才输出，避免删除段落后留下多余空行
+        function emit(line) {
+            if (line == "") { pending++; return }
+            while (pending > 0) { print ""; pending-- }
+            print line
+        }
+        function flush() {
+            if (inblk) {
+                if (!hit) { n = split(buf, arr, "\n"); for (i = 1; i <= n; i++) emit(arr[i]) }
+                buf = ""; hit = 0; inblk = 0
+            }
+        }
+        /^\[\[endpoints\]\]/ { flush(); inblk = 1; buf = $0 "\n"; next }
+        /^\[/ { flush(); emit($0); next }
+        {
+            if (inblk) {
+                buf = buf $0 "\n"
+                if ($0 ~ ("^listen = \"[^\"]*:" p "\"$")) hit = 1
+            } else {
+                emit($0)
+            }
+        }
+        END { flush() }
+    ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    [ -s "$tmp" ] || { rm -f "$tmp"; echo -e "${RED}错误: 处理配置后为空，已中止${PLAIN}"; return 1; }
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# 删除文件尾部空行（busybox 下无 tac，用 awk）
+cli_trim_trailing_blanks() {
+    local tmp
+    tmp=$(mktemp) || return 1
+    awk '
+        { lines[NR] = $0 }
+        END {
+            last = NR
+            while (last > 0 && lines[last] == "") last--
+            for (i = 1; i <= last; i++) print lines[i]
+        }
+    ' "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+cli_validate_listen_addr() {
+    local addr=$1
+    if [[ "$addr" == *:* ]] && [[ ! "$addr" =~ ^\[[0-9a-fA-F:]+\]$ ]]; then
+        echo -e "${RED}错误: --listen-addr 只能是 IP 或 [IPv6]，不能包含端口: $addr${PLAIN}"
+        return 1
+    fi
+    validate_ip "$addr"
+}
+
+run_cli() {
+    local listen_addr="[::]"
+    local do_restart=1
+    local -a specs=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --set-forward)
+                [ -z "${2:-}" ] && { echo -e "${RED}错误: --set-forward 需要一个参数${PLAIN}"; return 1; }
+                specs+=("$2"); shift 2 ;;
+            --set-forward=*)
+                specs+=("${1#*=}"); shift ;;
+            --listen-addr)
+                [ -z "${2:-}" ] && { echo -e "${RED}错误: --listen-addr 需要一个参数${PLAIN}"; return 1; }
+                listen_addr="$2"; shift 2 ;;
+            --listen-addr=*)
+                listen_addr="${1#*=}"; shift ;;
+            --no-restart)
+                do_restart=0; shift ;;
+            -h|--help)
+                cli_usage; return 0 ;;
+            *)
+                echo -e "${RED}错误: 未知参数: $1${PLAIN}"
+                cli_usage
+                return 1 ;;
+        esac
+    done
+
+    if [ ${#specs[@]} -eq 0 ]; then
+        echo -e "${RED}错误: 缺少 --set-forward 参数${PLAIN}"
+        cli_usage
+        return 1
+    fi
+
+    cli_validate_listen_addr "$listen_addr" || return 1
+
+    # 第一遍：全部解析校验通过后才落盘，避免半途失败留下残缺配置
+    # 注意: validate_port / validate_ip 内部也用 [[ =~ ]]，会覆盖 BASH_REMATCH，
+    # 因此必须先把捕获组存入局部变量再校验。
+    local -a lp_arr=() rip_arr=() rp_arr=()
+    local spec lp rip rp
+    for spec in "${specs[@]}"; do
+        if [[ ! "$spec" =~ ^([0-9]+):(\[[0-9a-fA-F:]+\]|[^:]+):([0-9]+)$ ]]; then
+            echo -e "${RED}错误: 规则格式无效: $spec${PLAIN}"
+            echo "  应为 <本机端口>:<远程IP或域名>:<远程端口>，例: 443:1.2.3.4:8443"
+            return 1
+        fi
+        lp="${BASH_REMATCH[1]}"
+        rip="${BASH_REMATCH[2]}"
+        rp="${BASH_REMATCH[3]}"
+        validate_port "$lp" || return 1
+        validate_port "$rp" || return 1
+        validate_ip "$rip" || return 1
+        lp_arr+=("$lp")
+        rip_arr+=("$rip")
+        rp_arr+=("$rp")
+    done
+
+    init_env
+
+    # 第二遍：应用规则（幂等：相同则跳过，不同则替换）
+    local i remote existing
+    for i in "${!lp_arr[@]}"; do
+        remote="${rip_arr[$i]}:${rp_arr[$i]}"
+        existing=$(cli_get_remote "${lp_arr[$i]}")
+
+        if [ "$existing" = "$remote" ]; then
+            echo -e "${GREEN}规则已存在，跳过: ${listen_addr}:${lp_arr[$i]} -> ${remote}${PLAIN}"
+            continue
+        fi
+
+        if [ -n "$existing" ]; then
+            echo -e "${YELLOW}替换规则: ${listen_addr}:${lp_arr[$i]} -> ${remote}（原 ${existing}）${PLAIN}"
+            cli_remove_endpoint "${lp_arr[$i]}" || { echo -e "${RED}错误: 更新配置失败${PLAIN}"; return 1; }
+        else
+            echo -e "${GREEN}添加规则: ${listen_addr}:${lp_arr[$i]} -> ${remote}${PLAIN}"
+        fi
+
+        # 去掉尾部空行后统一以 "\n[[endpoints]]" 追加，保证段间恰好一个空行
+        cli_trim_trailing_blanks || { echo -e "${RED}错误: 写入配置失败${PLAIN}"; return 1; }
+        printf '\n[[endpoints]]\nlisten = "%s:%s"\nremote = "%s:%s"\n' \
+            "$listen_addr" "${lp_arr[$i]}" "${rip_arr[$i]}" "${rp_arr[$i]}" >> "$CONFIG_FILE" \
+            || { echo -e "${RED}错误: 写入配置失败${PLAIN}"; return 1; }
+    done
+
+    if [ "$do_restart" -eq 0 ]; then
+        echo -e "${YELLOW}已跳过服务启用/重启（--no-restart）${PLAIN}"
+        return 0
+    fi
+
+    if [ ! -x "$REALM_BIN" ]; then
+        echo -e "${YELLOW}未检测到 realm 二进制，先执行安装...${PLAIN}"
+        install_realm || return 1
+    else
+        service_enable realm
+        service_restart realm
+    fi
+
+    if service_is_active realm; then
+        echo -e "${GREEN}服务已启用并重启${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}服务未运行，请检查: rc-service realm status${PLAIN}"
+    return 1
+}
+
 # --- 脚本更新 ---
 Update_Shell() {
     local url="https://raw.githubusercontent.com/zincles/realm-alpine-cli/main/realm.sh"
@@ -478,6 +694,11 @@ main() {
     done
 }
 
+# 有参数时走非交互式命令行模式，无参数时保持原有交互菜单行为
 if [ "${REALM_TESTING:-0}" != "1" ]; then
+    if [ $# -gt 0 ]; then
+        run_cli "$@"
+        exit $?
+    fi
     main
 fi

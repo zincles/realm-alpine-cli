@@ -64,12 +64,8 @@ if [ ! -x /root/realm/realm ]; then
   bash -c 'REALM_TESTING=1 . /realm.sh; install_realm' >/dev/null 2>&1 || true
 fi
 
-# 幂等补齐端点：仅在配置中尚无 [[endpoints]] 时写入
-# （原版 write_config_header 只写 [network]，realm 缺 endpoints 会拒绝启动）
-if ! grep -q '^\[\[endpoints\]\]' /root/.realm/config.toml 2>/dev/null; then
-  printf '\n[[endpoints]]\nlisten = "[::]:1234"\nremote = "1.1.1.1:443"\n' \
-    >> /root/.realm/config.toml
-fi
+# 设置转发规则：幂等，重复执行不会重复追加；--no-restart 因为由本脚本 exec 托管
+bash /realm.sh --set-forward "${FORWARD:-443:1.2.3.4:8443}" --no-restart || exit 1
 
 exec /root/realm/realm -c /root/.realm/config.toml
 ```
@@ -81,11 +77,18 @@ podman run -d --name realm \
   --init \
   -m 128m --restart=unless-stopped \
   -p 1234:1234 \
+  -e FORWARD=1234:1.1.1.1:443 \
   -v "$PWD/realm.sh:/realm.sh:ro" \
   -v "$PWD/entrypoint.sh:/entrypoint.sh:ro" \
   -v "$PWD/realm-data/bin:/root/realm" \
   -v "$PWD/realm-data/cfg:/root/.realm" \
   alpine:3.22 /bin/sh /entrypoint.sh
+```
+
+转发规则通过 `-e FORWARD=` 传入（格式 `<本机端口>:<远程IP或域名>:<远程端口>`），改规则只需改环境变量并重建容器。多个端口就发多个 `-p` 并改用多条 `--set-forward`（可把 entrypoint 里那行换成：
+
+```sh
+bash /realm.sh --set-forward "${FORWARD1}" --set-forward "${FORWARD2}" --no-restart || exit 1
 ```
 
 部署要点（五处都踩过坑）：
@@ -95,7 +98,7 @@ podman run -d --name realm \
 | **`--init` 建议加** | realm 作为 PID 1 时**不响应 SIGTERM**（内核不向 PID 1 施加默认信号动作），`podman stop` 会等满超时后发 SIGKILL（exit 137）。加 `--init` 让 `podman-init` 接管 PID 1 后，realm 收到 SIGTERM 干净退出（exit 143），停止/启动更快且不残留半关闭连接 |
 | `-p 监听端口:监听端口` | 不暴露端口时，容器内 realm 虽在监听，宿主机访问会 `Connection refused`。每个 `[[endpoints]]` 的 `listen` 端口都需在此发布，TCP/UDP 均要覆盖时加 `/udp` |
 | `-v .../bin:/root/realm` 与 `-v .../cfg:/root/.realm` | 挂载二进制与配置目录，避免容器重建后重新下载、规则丢失 |
-| 端点补齐必须幂等 | 无 `[[endpoints]]` 时 realm 报 `missing field 'endpoints'` 退出；但**无条件重复追加会导致 `failed to bind: Address in use` panic**，故用 `grep -q` 判断 |
+| 端点补齐由 `--set-forward` 保证幂等 | 无 `[[endpoints]]` 时 realm 报 `missing field 'endpoints'` 退出；重复追加会导致 `failed to bind: Address in use` panic。`--set-forward` 已内置幂等判断（同端口同远程跳过），可安全重复执行 |
 | 依赖安装失败不得中断启动 | 若写成 `set -e` + 无条件 `apk add`，**离线重启时容器会直接退出**，即使二进制与配置都已在卷中。必须先判断 `command -v bash`、`-x /root/realm/realm`，并给 `apk add` 加 `\|\| true` |
 
 实测数据（Alpine 3.22，rootless podman 5.4.2，`-m 128m`）：realm 常驻内存约 **2.9 MB**。已验证可用的路径：联网全新安装、离线重启（复用数据卷）、`stop` → `start`；三条路径均转发正常（TLSv1.3 握手成功）。
@@ -129,6 +132,47 @@ bash ./realm.sh
 ```
 
 进入菜单选 `1` 安装，再选 `3` 添加转发规则；脚本会自动 `rc-update add realm default`，重启后由 OpenRC 拉起 realm。
+
+## 命令行模式（非交互）
+
+除了交互菜单，脚本支持直接传参设置转发，便于脚本化与容器 entrypoint 使用：
+
+```sh
+# 本地 443 -> 1.2.3.4 的 8443，自动启用并重启 realm
+./realm.sh --set-forward 443:1.2.3.4:8443
+
+# 一次设置多条
+./realm.sh --set-forward 80:example.com:8080 --set-forward 443:1.2.3.4:8443
+
+# 仅写配置，不启用/重启服务（容器前台托管场景）
+./realm.sh --set-forward 443:1.2.3.4:8443 --no-restart
+
+# 指定本机监听地址（默认 [::]，双栈兼顾 IPv4）
+./realm.sh --set-forward 443:1.2.3.4:8443 --listen-addr 0.0.0.0
+
+# IPv6 远程地址需加方括号
+./realm.sh --set-forward 8443:[2001:db8::1]:443
+```
+
+| 选项 | 说明 |
+| --- | --- |
+| `--set-forward <本机端口>:<远程IP或域名>:<远程端口>` | 设置转发规则，可重复指定多条 |
+| `--listen-addr <地址>` | 本机监听地址，默认 `[::]` |
+| `--no-restart` | 仅写配置，不启用/重启服务 |
+| `-h`, `--help` | 显示帮助 |
+
+**行为**：
+
+- 端口不存在 → 新增规则
+- 端口已存在、远程地址相同 → 跳过（**幂等**，可反复执行）
+- 端口已存在、远程地址不同 → **替换**该条规则
+- 默认自动 `rc-update add realm default` 并重启 realm；二进制缺失时先自动安装
+- 全部规则先解析校验，**任一无效则整体不落盘**，不会留下残缺配置
+- 替换仅删除命中的那一个 `[[endpoints]]` 段，`[network]`、`[log]`、注释与其他端点原样保留
+
+退出码：成功 `0`，参数无效或服务未能运行 `1`。
+
+**无参数运行时行为不变**，仍进入交互菜单。
 
 ## 脚本界面
 
